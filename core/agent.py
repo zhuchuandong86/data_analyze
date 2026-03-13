@@ -17,11 +17,28 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
     report_out = "final_report.html"
 
     # ==========================================
-    # 【数据预处理】清理表头
+    # 【数据预处理】极限清理脏数据 (防线一)
     # ==========================================
-    df.columns = df.columns.str.strip().str.replace('\n', '').str.replace('\r', '')
+    # 1. 剔除全空的行和全空的列 (解决 Excel 拖拽导致的无限空行)
+    df.dropna(how='all', inplace=True)
+    df.dropna(axis=1, how='all', inplace=True)
+    
+    # 2. 过滤掉 Pandas 自动生成的无意义列名 (如 Unnamed: 0)
+    df = df.loc[:, ~df.columns.astype(str).str.contains('^Unnamed')]
+    
+    # 3. 强力清洗表头：转字符串 -> 去首尾空格 -> 删换行符 -> 替换全角空格
+    df.columns = df.columns.astype(str).str.strip().str.replace('\n', '').str.replace('\r', '').str.replace('　', '')
+    
+    # 4. 如果清洗后没有列了，直接熔断返回错误报告
+    if df.empty or len(df.columns) == 0:
+        error_html = "<h2 style='color:red;'>❌ 数据读取失败</h2><p>上传的表格似乎没有有效数据或表头，请检查文件格式。</p>"
+        with open(report_out, "w", encoding="utf-8") as f:
+            f.write(error_html)
+        return error_html, report_out
+
     columns_str = ", ".join(df.columns)
-    sample_str = df.head(3).to_string()
+    # 增加显示的样本数量，并处理 NaN 以防大模型误解
+    sample_str = df.head(5).fillna("空值(NaN)").to_string()
     
     if not user_query or not user_query.strip():
         user_query = f"对数据全面分析，字段包括：{columns_str}。计算各数值列的统计摘要，画出关键指标对比图表。"
@@ -326,10 +343,10 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
     analyst_prompt = ChatPromptTemplate.from_messages([
         ("system", """你是资深业务分析师。
 
-【铁律：禁止数据幻觉】——违反此条视为系统故障
-你只能使用下方【运行数据】中 print() 真实输出的数字。
-禁止自行编造任何数值、百分比、金额、笔数、排名！
-如果某个数字不在【运行数据】中，必须写"（数据未输出）"，绝不猜测！
+【铁律：禁止数据与图表幻觉】——违反此条视为系统故障
+1. 你只能使用下方【运行数据】中 print() 真实输出的数字。
+2. 绝不能自行编造任何数值。
+3. 【最重要】如果【图表状态】显示没有任何图表生成，或者没有提到某个特定的图表序号，你**绝对禁止**在报告中写出任何类似 [CHART_1]、[CHART_2] 的占位符！千万不要自己预设图表！
 
 【分析计划】
 {analysis_plan}
@@ -337,11 +354,12 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
 【运行数据】（这是代码实际 print 的内容，是唯一真实数据来源）
 {data_insights}
 
-【图表状态】
+【图表状态】（极其重要：只有这里列出的图表才能使用占位符引用！）
 {chart_status}
 
 处理规则：
-- 若【运行数据】有真实数字：按分析计划解读，只插入【图表状态】中真实存在的 [CHART_X]
+- 若【运行数据】有真实数字：按分析计划解读。
+- 插入图表时，核对【图表状态】。如果状态是"未生成任何图表"，你的报告中禁止出现任何 [CHART_X] 标记。
 - 若【运行数据】为空：直接写"代码未输出任何数据，无法生成报告。"，停止输出"""),
         ("user", "原需求：{query}")
     ])
