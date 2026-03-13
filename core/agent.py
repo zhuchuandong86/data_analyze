@@ -155,6 +155,15 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
 
             print("\n\n[+] 代码接收完毕，开始在沙盒中执行...")
             clean_code = raw_code.replace("```python", "").replace("```", "").strip()
+            # 强制在 LLM 代码最前面插入 Agg，无论 LLM 是否自己 import matplotlib 都生效
+            agg_prefix = (
+                "import matplotlib\n"
+                "matplotlib.use('Agg')\n"
+                "import matplotlib.pyplot as plt\n"
+                "plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']\n"
+                "plt.rcParams['axes.unicode_minus'] = False\n"
+            )
+            clean_code = agg_prefix + clean_code
         except Exception as e:
             execution_error = f"API超时或断开: {e}"
             print(f"\n[-] {execution_error}")
@@ -176,14 +185,16 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
             print(f"   [i] 图表将保存至: {chart_dir}")
 
             with redirect_stdout(captured_output):
-                exec_env = {
-                    "df": df, "pd": pd,
-                    "matplotlib": matplotlib, "plt": _plt,
-                    "os": os,
-                }
+                exec_env = {"df": df, "pd": pd, "os": os}
                 exec(clean_code, exec_env)
             charts_found = glob.glob("chart_*.png")
-            print(f"[+] 代码执行成功！已生成图表: {charts_found if charts_found else "无"}")
+            captured_preview = captured_output.getvalue().strip()
+            if captured_preview:
+                print(f"[+] 代码执行成功！已生成图表: {charts_found}")
+                print(f"   [i] 数据输出预览:\n{captured_preview[:500]}")
+            else:
+                print(f"[+] 代码执行成功！已生成图表: {charts_found}")
+                print("   [!] 警告：代码无任何 print 输出，分析师将无真实数据可用！")
         except Exception as e:
             execution_error = str(e)
             print(f"[-] 执行报错：{execution_error}")
