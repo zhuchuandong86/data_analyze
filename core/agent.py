@@ -9,6 +9,8 @@ import pandas as pd
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from utils.reporter import generate_html_report
+import pandas as df
+
 
 
 def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base: str):
@@ -20,30 +22,26 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
     df.columns = df.columns.str.strip().str.replace('\n', '').str.replace('\r', '')
     columns_str = ", ".join(df.columns)
     sample_str = df.head(3).to_string()
-    # user_query 为空时提供兜底，否则 LLM 会输出聊天文字而非代码
+    
     if not user_query or not user_query.strip():
         user_query = f"对数据全面分析，字段包括：{columns_str}。计算各数值列的统计摘要，画出关键指标对比图表。"
-        print(f"[i] 用户未输入需求，使用默认指令。")  # 给 Planner 看几行样本，帮助判断数据类型
+        print(f"[i] 用户未输入需求，使用默认指令。")
 
     # ==========================================
     # 🌟 异构模型配置
     # ==========================================
-    # 程序员：专职写代码，Temperature=0 保证严谨
     llm_coder = ChatOpenAI(
-        temperature=0, model="qwen2.5-coder-32b-instruct",
+        temperature=0, model="deepseek-v3-0324",
         api_key=api_key, base_url=api_base, timeout=120
     )
-    # 规划师：轻量快速，只需要输出结构化计划
     llm_planner = ChatOpenAI(
         temperature=0, model="deepseek-v3-0324",
         api_key=api_key, base_url=api_base, timeout=60
     )
-    # 分析师：写报告，稍微发散
     llm_analyst = ChatOpenAI(
         temperature=0.3, model="deepseek-v3-0324",
         api_key=api_key, base_url=api_base, timeout=120
     )
-    # 检察官：格式清洗，换成轻量模型节省成本（原来用 r1 太贵了）
     llm_judge = ChatOpenAI(
         temperature=0, model="deepseek-v3-0324",
         api_key=api_key, base_url=api_base, timeout=120
@@ -87,8 +85,6 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
 
     # ==========================================
     # Node 1 & 2：👨‍💻 程序员 Agent — Reflexion 自修复
-    # 改造点：每次失败后先"反思"，生成结构化修复记忆，
-    #         带着经验重写，而不是盲目粘贴报错重试。
     # ==========================================
     max_retries = 3
     attempt = 0
@@ -96,19 +92,15 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
     data_insights = ""
     clean_code = ""
 
-    # 用固定临时目录存图表，避免工作目录不确定导致找不到文件
     chart_dir = tempfile.mkdtemp(prefix="agent_charts_")
     print(f"[i] 图表临时目录: {chart_dir}")
 
-    # Reflexion 记忆列表：每次失败都往里追加一条结构化反思
     reflexion_memory = []
-    # 必须在循环外初始化！若每次都在 API 阶段 continue，循环内的赋值永远不会执行
     captured_output = io.StringIO()
 
     while attempt < max_retries and execution_error:
         attempt += 1
 
-        # 把历史反思记忆格式化给 Coder 看
         if reflexion_memory:
             memory_str = "\n".join([
                 f"【第{m['attempt']}次失败反思】\n"
@@ -125,29 +117,35 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
         print(f"[*] 👨‍💻 程序员 Agent 开始写代码 (第 {attempt}/{max_retries} 次，携带 {len(reflexion_memory)} 条反思记忆)")
         print(f"===========================================\n")
 
+        # 【新增/优化】：强化预处理法则，要求引入 re，并防守型编程
         code_prompt = ChatPromptTemplate.from_messages([
-            ("system", """你是顶级数据分析 Python 程序员，擅长无线网络数据分析。
+            ("system", """你是顶级数据分析 Python 程序员，擅长复杂数据分析。
 当前已加载数据框 `df`。表头: [{columns_str}]
 
-【本次分析计划】（Planner 已制定，请严格遵照执行）
+【数据预处理黄金法则】（极其重要）
+在进行任何计算前，如果数值列（如金额、价格）包含中文或特殊符号（如 '151.11(已退款)'）：
+必须使用正则提取核心数字，推荐写法：`df['列名'] = df['列名'].astype(str).str.extract(r'(-?\d+\.?\d*)')[0].astype(float)`。切忌使用简单的 replace。
+遇到类型转换，尽量使用 pd.to_numeric(..., errors='coerce') 把无法解析的变成 NaN，避免程序崩溃。
+
+【本次分析计划】
 {analysis_plan}
 
 【Reflexion 历史修复记忆】（认真阅读，避免重蹈覆辙）
 {memory_str}
 
 【编码规范】
-1. 必须 import pandas as pd, import matplotlib.pyplot as plt
+1. 必须 import pandas as pd, import matplotlib.pyplot as plt, import re
 2. 中文字体防乱码：
    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
    plt.rcParams['axes.unicode_minus'] = False
-3. 含货币符或字符的数值列，先用正则清洗转为数字。
-4. 图表保存为 'chart_1.png'（依次递增），绝不使用 plt.show()。
-5. 代码中绝对不能出现中文全角标点符号！
-6. 【核心要求】每算出一个关键数值，必须立刻 print() 出来！格式示例：
-   print(f"下行速率均值: {{avg_val:.2f}}")  # 用实际变量名，花括号双写避免LangChain误解析
-   分析师只能看到 print 输出，没有 print 就等于没有数据，报告会全是 XX！
-7. 只输出纯 Python 代码，不要任何 markdown 或注释！"""),
-            ("user", "分析需求：{query}")
+3. 图表保存为 'chart_1.png'（依次递增），绝不使用 plt.show()。
+4. 代码中绝对不能出现中文全角标点符号！
+5. 【核心要求】每算出一个关键数值，必须立刻 print() 出来！格式示例：
+   print(f"下行速率均值: {{avg_val:.2f}}")
+   分析师只能看到 print 输出，没有 print 就等于没有数据！
+6. 只输出纯 Python 代码，不要任何 markdown 或注释！"""),
+            # 【新增/优化】：将真实数据样本喂给 Coder，避免盲目猜测数据格式
+            ("user", "分析需求：{query}\n\n【重要】真实数据样本预览：\n{sample}")
         ])
 
         try:
@@ -156,14 +154,15 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
                 "columns_str": columns_str,
                 "analysis_plan": analysis_plan,
                 "memory_str": memory_str,
-                "query": user_query
+                "query": user_query,
+                "sample": sample_str  # 传入样本
             }):
                 raw_code += chunk.content
                 print(chunk.content, end="", flush=True)
 
             print("\n\n[+] 代码接收完毕，开始在沙盒中执行...")
             clean_code = raw_code.replace("```python", "").replace("```", "").strip()
-            # 全角标点终极清洗
+            
             FULLWIDTH_MAP = {
                 "，": ",", "。": ".", "：": ":", "；": ";",
                 "（": "(", "）": ")", "【": "[", "】": "]",
@@ -172,7 +171,7 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
             }
             for zh, en in FULLWIDTH_MAP.items():
                 clean_code = clean_code.replace(zh, en)
-            # 验证：第一行以中文开头说明 LLM 输出了聊天文字而非代码
+            
             first_line = clean_code.strip().splitlines()[0] if clean_code.strip() else ""
             if first_line and "一" <= first_line[0] <= "鿿":
                 execution_error = f"LLM输出了聊天文字而非代码：{first_line[:50]}"
@@ -180,8 +179,8 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
                 reflexion_memory.append({"attempt": attempt, "error": execution_error,
                     "fix_strategy": "必须直接输出Python代码，禁止聊天或提问！"})
                 continue
-            # switch_backend 可在已有后端时强制切换，use() 做不到这一点
-            # 同时把图表保存路径改为绝对路径的临时目录，避免工作目录混乱
+            
+            # 【修复点】：增加 hasattr 判断，防止 Reflexion 多次重试时无限递归死循环
             agg_prefix = (
                 "import matplotlib\n"
                 "import matplotlib.pyplot as plt\n"
@@ -190,14 +189,15 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
                 "plt.rcParams['axes.unicode_minus'] = False\n"
                 f"__chart_dir__ = r'{chart_dir}'\n"
                 "import os as __os__\n"
-                # 劫持 plt.savefig：把相对路径自动重写为临时目录里的绝对路径
-                "def __patched_savefig__(fname, *a, **kw):\n"
-                "    if not __os__.path.isabs(str(fname)):\n"
-                "        fname = __os__.path.join(__chart_dir__, __os__.path.basename(str(fname)))\n"
-                "    plt._original_savefig(fname, *a, **kw)\n"
-                "plt._original_savefig = plt.savefig\n"
-                "plt.savefig = __patched_savefig__\n"
+                "if not hasattr(plt, '_original_savefig'):\n"
+                "    plt._original_savefig = plt.savefig\n"
+                "    def __patched_savefig__(fname, *a, **kw):\n"
+                "        if not __os__.path.isabs(str(fname)):\n"
+                "            fname = __os__.path.join(__chart_dir__, __os__.path.basename(str(fname)))\n"
+                "        plt._original_savefig(fname, *a, **kw)\n"
+                "    plt.savefig = __patched_savefig__\n"
             )
+
             clean_code = agg_prefix + clean_code
         except Exception as e:
             execution_error = f"API超时或断开: {e}"
@@ -208,8 +208,6 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
         captured_output = io.StringIO()
         execution_error = None
         try:
-            # 预注入 Agg 后端的 matplotlib/plt
-            # Windows + Streamlit headless 环境下必须强制 Agg，否则 savefig 静默失败
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as _plt
@@ -217,8 +215,9 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
             _plt.rcParams["axes.unicode_minus"] = False
 
             with redirect_stdout(captured_output):
-                exec_env = {"df": df, "pd": pd, "os": os}
+                exec_env = {"df": df, "pd": pd, "os": os, "re": re}
                 exec(clean_code, exec_env)
+                
             charts_found = glob.glob(os.path.join(chart_dir, "chart_*.png"))
             captured_preview = captured_output.getvalue().strip()
             if captured_preview:
@@ -231,12 +230,7 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
             execution_error = str(e)
             print(f"[-] 执行报错：{execution_error}")
 
-            # ======================================
-            # 🔁 Reflexion：失败后先反思，再重写
-            # 让 Coder 自己分析根因并制定修复策略
-            # ======================================
             print("\n[*] 🔁 Reflexion：正在反思失败原因，生成修复记忆...")
-
             reflect_prompt = ChatPromptTemplate.from_messages([
                 ("system", """你是代码调试专家。分析下面的报错，输出结构化反思。
 严格按如下格式，每项一行，不要多余内容：
@@ -252,12 +246,11 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
                 reflect_raw = ""
                 for chunk in (reflect_prompt | llm_coder).stream({
                     "error": execution_error,
-                    "code": clean_code[-2000:]  # 只取末尾 2000 字符避免 token 超限
+                    "code": clean_code[-2000:]
                 }):
                     reflect_raw += chunk.content
                     print(chunk.content, end="", flush=True)
 
-                # 解析反思结果
                 for line in reflect_raw.splitlines():
                     if line.startswith("根因判断:"):
                         reflection["root_cause"] = line.replace("根因判断:", "").strip()
@@ -276,21 +269,52 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
             reflexion_memory.append(reflection)
 
     # ==========================================
-    # 梳理产物
+    # 【新增/优化】：梳理产物 & 熔断机制 (Fail-Fast)
+    # 彻底拦截失败任务，不让后续模型浪费 Token 写无用报告
     # ==========================================
     data_insights = captured_output.getvalue()
-    generated_charts = glob.glob("chart_*.png")
+    generated_charts = glob.glob(os.path.join(chart_dir, "chart_*.png"))
 
     if execution_error:
-        data_insights = (
-            f"【系统提示】代码经过 {max_retries} 次 Reflexion 修复依然失败。\n"
-            f"最终报错：{execution_error}\n"
-            f"历史反思记录：\n" +
-            "\n".join([f"  第{m['attempt']}次 - {m['root_cause']}" for m in reflexion_memory])
-        )
-        chart_status = "未生成任何图表，严禁使用 [CHART] 占位符！"
-    else:
-        chart_status = f"生成的图表文件有：{generated_charts}。只能使用对应的占位符！"
+        print(f"\n[!] 触发熔断机制：代码修复超过 {max_retries} 次依然失败，立即停止后续 Agent 调用以节省 Token。")
+        
+        # 构建一个优雅的降级 HTML 错误报告
+        memory_html = "".join([
+            f"<li style='margin-bottom:8px;'><b>第{m['attempt']}次反思：</b> {m['root_cause']}<br><i style='color:#666;'>对策：{m['fix_strategy']}</i></li>" 
+            for m in reflexion_memory
+        ])
+        
+        error_html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>数据分析中断</title></head>
+<body style="font-family: 'Segoe UI', sans-serif; padding: 20px; background-color: #f4f7f6;">
+    <div style="max-width: 900px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 8px; border-top: 5px solid #e74c3c; box-shadow: 0 4px 15px rgba(0,0,0,0.05);">
+        <h2 style="color: #c0392b; margin-top: 0;">⚠️ 数据分析中断 (熔断保护生效)</h2>
+        <p>AI 程序员经过 <b>{max_retries}</b> 次自我反思与代码重写，仍未能完全解决数据清洗/计算过程中的报错。为节省计算资源 (Token)，已自动停止后续分析报告的生成。</p>
+        
+        <h4 style="color: #2c3e50; border-bottom: 1px solid #eee; padding-bottom: 5px;">最后一次致命报错：</h4>
+        <pre style="background: #fdf2f2; padding: 15px; border-radius: 6px; overflow-x: auto; color: #c0392b; font-size: 14px;">{execution_error}</pre>
+        
+        <h4 style="color: #2c3e50; border-bottom: 1px solid #eee; padding-bottom: 5px; margin-top: 25px;">🧠 AI 努力过的反思记录：</h4>
+        <ul style="background: #f8f9fa; padding: 15px 35px; border-radius: 6px; font-size: 14px; line-height: 1.6;">
+            {memory_html}
+        </ul>
+        
+        <div style="margin-top: 30px; padding: 15px; background: #e8f4f8; border-radius: 6px; color: #2980b9;">
+            <h4 style="margin: 0 0 10px 0;">💡 人工干预建议：</h4>
+            <p style="margin: 0; font-size: 14px;">您的数据中可能存在过于复杂的业务混合格式（如金额列中带有大量文本说明）。建议在左侧“分析需求”框中明确提示 AI，例如：<b>“清洗金额字段时，请用正则表达式强制提取括号前的数字作为浮点数，忽略无法转换的值。”</b></p>
+        </div>
+    </div>
+</body>
+</html>"""
+        
+        # 将错误报告写入文件并直接 return（熔断）
+        with open(report_out, "w", encoding="utf-8") as f:
+            f.write(error_html)
+        return error_html, report_out
+
+    # 如果代码执行成功，才记录生成的图表
+    chart_status = f"生成的图表文件有：{[os.path.basename(c) for c in generated_charts]}。只能使用对应的占位符！"
 
     # ==========================================
     # Node 3：🧑‍💼 分析师 Agent — 参考 Planner 计划写报告
@@ -317,7 +341,6 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
 {chart_status}
 
 处理规则：
-- 若【运行数据】含"致命错误"：只输出故障诊断，禁止写任何分析数字和 [CHART] 占位符
 - 若【运行数据】有真实数字：按分析计划解读，只插入【图表状态】中真实存在的 [CHART_X]
 - 若【运行数据】为空：直接写"代码未输出任何数据，无法生成报告。"，停止输出"""),
         ("user", "原需求：{query}")
@@ -338,7 +361,7 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
         draft_report = f"草稿生成失败: {e}"
 
     # ==========================================
-    # Node 4：⚖️ 检察官 Agent — 格式清洗（换轻量模型）
+    # Node 4：⚖️ 检察官 Agent — 格式清洗
     # ==========================================
     print(f"\n===========================================")
     print("[*] ⚖️ 检察官 Agent 正在质检报告...")
@@ -367,7 +390,6 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
     # ==========================================
     # Node 5：⚙️ 渲染引擎
     # ==========================================
-    # 把临时目录里的图表复制到工作目录，reporter 才能找到
     import shutil
     copied = []
     for src in glob.glob(os.path.join(chart_dir, "chart_*.png")):
