@@ -144,8 +144,7 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
 4. 图表保存为 'chart_1.png'（依次递增），绝不使用 plt.show()。
 5. 代码中绝对不能出现中文全角标点符号！
 6. 【核心要求】每算出一个关键数值，必须立刻 print() 出来！格式示例：
-   print(f"4G忙时平均下行速率: {avg_speed:.2f} Mbps")
-   print(f"PRB利用率超80%小区数: {high_prb_count} 个，占比 {ratio:.1%}")
+   print(f"下行速率均值: {{avg_val:.2f}}")  # 用实际变量名，花括号双写避免LangChain误解析
    分析师只能看到 print 输出，没有 print 就等于没有数据，报告会全是 XX！
 7. 只输出纯 Python 代码，不要任何 markdown 或注释！"""),
             ("user", "分析需求：{query}")
@@ -302,10 +301,25 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
 
     analyst_prompt = ChatPromptTemplate.from_messages([
         ("system", """你是资深业务分析师。
-【分析计划】\n{analysis_plan}
-【运行数据】\n{data_insights}
-【图表状态】\n{chart_status}
-任务：严格按照分析计划的维度组织报告结构，深度解读数据，在段落中合理插入图表占位符（如 `[CHART_1]`）。"""),
+
+【铁律：禁止数据幻觉】——违反此条视为系统故障
+你只能使用下方【运行数据】中 print() 真实输出的数字。
+禁止自行编造任何数值、百分比、金额、笔数、排名！
+如果某个数字不在【运行数据】中，必须写"（数据未输出）"，绝不猜测！
+
+【分析计划】
+{analysis_plan}
+
+【运行数据】（这是代码实际 print 的内容，是唯一真实数据来源）
+{data_insights}
+
+【图表状态】
+{chart_status}
+
+处理规则：
+- 若【运行数据】含"致命错误"：只输出故障诊断，禁止写任何分析数字和 [CHART] 占位符
+- 若【运行数据】有真实数字：按分析计划解读，只插入【图表状态】中真实存在的 [CHART_X]
+- 若【运行数据】为空：直接写"代码未输出任何数据，无法生成报告。"，停止输出"""),
         ("user", "原需求：{query}")
     ])
 
