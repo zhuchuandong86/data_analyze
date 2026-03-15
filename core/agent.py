@@ -9,40 +9,41 @@ import pandas as pd
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from utils.reporter import generate_html_report
-import pandas as df
-
+import streamlit as st
+from datetime import datetime
 
 
 def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base: str):
-    report_out = "final_report.html"
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_out = f"final_report_{current_time}.html"
 
     # ==========================================
-    # 【数据预处理】极限清理脏数据 (防线一)
+    # 【数据预处理】终极数据洗手池 
     # ==========================================
-    # 1. 剔除全空的行和全空的列 (解决 Excel 拖拽导致的无限空行)
     df.dropna(how='all', inplace=True)
     df.dropna(axis=1, how='all', inplace=True)
-    
-    # 2. 过滤掉 Pandas 自动生成的无意义列名 (如 Unnamed: 0)
     df = df.loc[:, ~df.columns.astype(str).str.contains('^Unnamed')]
-    
-    # 3. 强力清洗表头：转字符串 -> 去首尾空格 -> 删换行符 -> 替换全角空格
     df.columns = df.columns.astype(str).str.strip().str.replace('\n', '').str.replace('\r', '').str.replace('　', '')
     
-    # 4. 如果清洗后没有列了，直接熔断返回错误报告
     if df.empty or len(df.columns) == 0:
-        error_html = "<h2 style='color:red;'>❌ 数据读取失败</h2><p>上传的表格似乎没有有效数据或表头，请检查文件格式。</p>"
-        with open(report_out, "w", encoding="utf-8") as f:
-            f.write(error_html)
-        return error_html, report_out
+        error_html = "<h2 style='color:red;'>❌ 数据读取失败</h2><p>表格无有效数据。</p>"
+        with open(report_out, "w", encoding="utf-8") as f: f.write(error_html)
+        return error_html, report_out, {}  # 【修改】增加第三个返回值，返回空上下文
+
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = df[col].replace(['-', '--', '无', 'N/A', 'NA', 'null', ''], pd.NA)
+            temp_col = df[col].astype(str).str.replace(r'[¥$,\s]', '', regex=True)
+            converted = pd.to_numeric(temp_col, errors='coerce')
+            if converted.notna().mean() > 0.5:
+                df[col] = converted
 
     columns_str = ", ".join(df.columns)
-    # 增加显示的样本数量，并处理 NaN 以防大模型误解
     sample_str = df.head(5).fillna("空值(NaN)").to_string()
     
     if not user_query or not user_query.strip():
         user_query = f"对数据全面分析，字段包括：{columns_str}。计算各数值列的统计摘要，画出关键指标对比图表。"
-        print(f"[i] 用户未输入需求，使用默认指令。")
+        st.info("💡 用户未输入需求，系统使用默认探索指令。")
 
     # ==========================================
     # 🌟 异构模型配置
@@ -59,59 +60,54 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
         temperature=0.3, model="deepseek-v3-0324",
         api_key=api_key, base_url=api_base, timeout=120
     )
-    llm_judge = ChatOpenAI(
-        temperature=0, model="deepseek-v3-0324",
-        api_key=api_key, base_url=api_base, timeout=120
-    )
 
     # ==========================================
-    # Node 0：🗺️ Planner Agent — 动态制定分析计划
+    # Node 0：🗺️ Planner Agent
     # ==========================================
-    print("\n===========================================")
-    print("[*] 🗺️ Planner Agent 正在分析数据，制定分析计划...")
-    print("===========================================\n")
+    st.markdown("### 🗺️ Planner Agent 正在分析数据，制定分析计划...")
 
     planner_prompt = ChatPromptTemplate.from_messages([
-        ("system", """你是一个数据分析规划师。根据用户提供的数据表信息，制定一份简洁的分析计划。
+        ("system", """你是一名顶尖的数据科学家。请对输入数据进行专业的 EDA (探索性数据分析) 和 KDD (知识发现) 规划。
 
-【输出格式要求】严格按如下格式输出，不要多余废话：
-数据类型: <电信网络数据 / 销售业务数据 / 财务数据 / 通用数据>
-分析维度:
-1. <维度一，10字以内>
-2. <维度二，10字以内>
-3. <维度三，10字以内>
+【输出格式要求】严格按如下格式输出：
+数据类型: <业务场景识别>
+分析思路：模式 → 假设 → 驱动因素 → 洞察 → 行动建议
+深度分析维度:
+1. 描述性分析: <指出需要统计哪些核心宏观指标和分布特征>
+2. 诊断性分析: <指出可能存在的异常点，并提出根因分析(RCA)的方向>
+3. 预测与指导性分析: <提出业务优化建议、资源分配方向或聚类分层建议>
 核心指标: <列出3-5个最关键的字段名>
-图表建议: <建议生成哪几类图表，一行内说完>
-质差/异常排查重点: <如果是电信数据，写出重点排查方向；否则写"通用异常检测">"""),
+图表建议: <列出专业图表，如"双变量相关性散点图", "异常值箱线图", "核心指标趋势折线图">
+数据挖掘挖掘点: <如果进行特征工程或关联分析，最值得挖掘的变量是什么？>"""),
         ("user", "表头: {columns}\n\n数据样本:\n{sample}\n\n用户需求: {query}")
     ])
 
     analysis_plan = ""
     try:
+        plan_placeholder = st.empty()
+        count = 0
         for chunk in (planner_prompt | llm_planner).stream({
-            "columns": columns_str,
-            "sample": sample_str,
-            "query": user_query
+            "columns": columns_str, "sample": sample_str, "query": user_query
         }):
             analysis_plan += chunk.content
-            print(chunk.content, end="", flush=True)
-        print("\n\n[+] 分析计划制定完毕！")
+            count += 1
+            if count % 8 == 0:  # 节流
+                plan_placeholder.markdown(f"```text\n{analysis_plan}▌\n```")
+        plan_placeholder.markdown(f"```text\n{analysis_plan}\n```")
+        st.success("✅ 分析计划制定完毕！")
     except Exception as e:
         analysis_plan = "通用数据分析：趋势、对比、异常检测"
-        print(f"\n[-] Planner 调用失败，使用默认计划：{e}")
+        st.error(f"❌ Planner 调用失败，使用默认计划：{e}")
 
     # ==========================================
-    # Node 1 & 2：👨‍💻 程序员 Agent — Reflexion 自修复
+    # Node 1 & 2：👨‍💻 程序员 Agent
     # ==========================================
     max_retries = 3
     attempt = 0
     execution_error = "Initial"
     data_insights = ""
     clean_code = ""
-
     chart_dir = tempfile.mkdtemp(prefix="agent_charts_")
-    print(f"[i] 图表临时目录: {chart_dir}")
-
     reflexion_memory = []
     captured_output = io.StringIO()
 
@@ -130,54 +126,58 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
         else:
             memory_str = "无历史报错，首次尝试。"
 
-        print(f"\n===========================================")
-        print(f"[*] 👨‍💻 程序员 Agent 开始写代码 (第 {attempt}/{max_retries} 次，携带 {len(reflexion_memory)} 条反思记忆)")
-        print(f"===========================================\n")
+        st.markdown(f"### 👨‍💻 程序员 Agent 开始写代码 (第 {attempt}/{max_retries} 次)")
+        if reflexion_memory:
+            st.caption(f"已携带 {len(reflexion_memory)} 条反思记忆")
 
-        # 【新增/优化】：强化预处理法则，要求引入 re，并防守型编程
+        # 【修改】：防崩溃铁律升级，强调“独立容错，继续执行”
         code_prompt = ChatPromptTemplate.from_messages([
-            ("system", """你是顶级数据分析 Python 程序员，擅长复杂数据分析。
+            ("system", """你是顶级数据分析 Python 程序员。
 当前已加载数据框 `df`。表头: [{columns_str}]
-
-【数据预处理黄金法则】（极其重要）
-在进行任何计算前，如果数值列（如金额、价格）包含中文或特殊符号（如 '151.11(已退款)'）：
-必须使用正则提取核心数字，推荐写法：`df['列名'] = df['列名'].astype(str).str.extract(r'(-?\d+\.?\d*)')[0].astype(float)`。切忌使用简单的 replace。
-遇到类型转换，尽量使用 pd.to_numeric(..., errors='coerce') 把无法解析的变成 NaN，避免程序崩溃。
 
 【本次分析计划】
 {analysis_plan}
 
-【Reflexion 历史修复记忆】（认真阅读，避免重蹈覆辙）
+【历史修复记忆】
 {memory_str}
 
-【编码规范】
+【编码规范】(必须严格遵守)
 1. 必须 import pandas as pd, import matplotlib.pyplot as plt, import re
 2. 中文字体防乱码：
    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
    plt.rcParams['axes.unicode_minus'] = False
 3. 图表保存为 'chart_1.png'（依次递增），绝不使用 plt.show()。
-4. 代码中绝对不能出现中文全角标点符号！
-5. 【核心要求】每算出一个关键数值，必须立刻 print() 出来！格式示例：
-   print(f"下行速率均值: {{avg_val:.2f}}")
-   分析师只能看到 print 输出，没有 print 就等于没有数据！
+4. 【防崩溃铁律-极限容错】：因为数据可能极度不规范，**你必须为每一个独立的指标计算、每一张独立图表的生成，分别使用独立的 try-except 块包裹！**
+   即使某个图表或指标报错，在 except 中 print 错误信息后，程序**必须继续往下执行**去画下一张图！绝不能让整个脚本中断！
+   示例：
+   try:
+       # 计算和画图逻辑 A
+   except Exception as e:
+       print(f"部分生成失败: {{e}}")
+   try:
+       # 计算和画图逻辑 B
+   except Exception as e:
+       pass
+5. 每算出一个关键数值，必须 print()！分析师只能看到 print 输出！
 6. 只输出纯 Python 代码，不要任何 markdown 或注释！"""),
-            # 【新增/优化】：将真实数据样本喂给 Coder，避免盲目猜测数据格式
             ("user", "分析需求：{query}\n\n【重要】真实数据样本预览：\n{sample}")
         ])
 
         try:
             raw_code = ""
+            code_placeholder = st.empty()
+            count = 0
             for chunk in (code_prompt | llm_coder).stream({
-                "columns_str": columns_str,
-                "analysis_plan": analysis_plan,
-                "memory_str": memory_str,
-                "query": user_query,
-                "sample": sample_str  # 传入样本
+                "columns_str": columns_str, "analysis_plan": analysis_plan,
+                "memory_str": memory_str, "query": user_query, "sample": sample_str
             }):
                 raw_code += chunk.content
-                print(chunk.content, end="", flush=True)
+                count += 1
+                if count % 8 == 0:  # 节流
+                    code_placeholder.markdown(f"```python\n{raw_code}▌\n```")
+            code_placeholder.markdown(f"```python\n{raw_code}\n```")
 
-            print("\n\n[+] 代码接收完毕，开始在沙盒中执行...")
+            st.info("⚙️ 代码接收完毕，开始在沙盒中执行...")
             clean_code = raw_code.replace("```python", "").replace("```", "").strip()
             
             FULLWIDTH_MAP = {
@@ -192,12 +192,11 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
             first_line = clean_code.strip().splitlines()[0] if clean_code.strip() else ""
             if first_line and "一" <= first_line[0] <= "鿿":
                 execution_error = f"LLM输出了聊天文字而非代码：{first_line[:50]}"
-                print(f"\n[-] {execution_error}")
+                st.error(f"❌ {execution_error}")
                 reflexion_memory.append({"attempt": attempt, "error": execution_error,
                     "fix_strategy": "必须直接输出Python代码，禁止聊天或提问！"})
                 continue
             
-            # 【修复点】：增加 hasattr 判断，防止 Reflexion 多次重试时无限递归死循环
             agg_prefix = (
                 "import matplotlib\n"
                 "import matplotlib.pyplot as plt\n"
@@ -214,14 +213,12 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
                 "        plt._original_savefig(fname, *a, **kw)\n"
                 "    plt.savefig = __patched_savefig__\n"
             )
-
             clean_code = agg_prefix + clean_code
         except Exception as e:
             execution_error = f"API超时或断开: {e}"
-            print(f"\n[-] {execution_error}")
+            st.error(f"❌ {execution_error}")
             continue
 
-        # 沙盒执行
         captured_output = io.StringIO()
         execution_error = None
         try:
@@ -238,16 +235,16 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
             charts_found = glob.glob(os.path.join(chart_dir, "chart_*.png"))
             captured_preview = captured_output.getvalue().strip()
             if captured_preview:
-                print(f"[+] 代码执行成功！已生成图表: {charts_found}")
-                print(f"   [i] 数据输出预览:\n{captured_preview[:500]}")
+                st.success(f"✅ 代码执行成功！已生成图表: {[os.path.basename(c) for c in charts_found]}")
+                with st.expander("👀 查看运行数据输出 (供分析师参考)"):
+                    st.code(captured_preview[:2000] + ("\n...(已省略)" if len(captured_preview)>2000 else ""))
             else:
-                print(f"[+] 代码执行成功！已生成图表: {charts_found}")
-                print("   [!] 警告：代码无任何 print 输出，分析师将无真实数据可用！")
+                st.warning("⚠️ 警告：代码无任何 print 输出，分析师将无真实数据可用！")
         except Exception as e:
             execution_error = str(e)
-            print(f"[-] 执行报错：{execution_error}")
+            st.error(f"❌ 执行报错：{execution_error}")
 
-            print("\n[*] 🔁 Reflexion：正在反思失败原因，生成修复记忆...")
+            st.warning("🔁 Reflexion：正在反思失败原因，生成修复记忆...")
             reflect_prompt = ChatPromptTemplate.from_messages([
                 ("system", """你是代码调试专家。分析下面的报错，输出结构化反思。
 严格按如下格式，每项一行，不要多余内容：
@@ -261,12 +258,16 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
                           "root_cause": "", "fix_strategy": "", "avoid": ""}
             try:
                 reflect_raw = ""
+                reflect_placeholder = st.empty()
+                count = 0
                 for chunk in (reflect_prompt | llm_coder).stream({
-                    "error": execution_error,
-                    "code": clean_code[-2000:]
+                    "error": execution_error, "code": clean_code[-2000:]
                 }):
                     reflect_raw += chunk.content
-                    print(chunk.content, end="", flush=True)
+                    count += 1
+                    if count % 8 == 0:  # 节流
+                        reflect_placeholder.markdown(f"```text\n{reflect_raw}▌\n```")
+                reflect_placeholder.markdown(f"```text\n{reflect_raw}\n```")
 
                 for line in reflect_raw.splitlines():
                     if line.startswith("根因判断:"):
@@ -276,134 +277,77 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
                     elif line.startswith("禁止重蹈:"):
                         reflection["avoid"] = line.replace("禁止重蹈:", "").strip()
 
-                print(f"\n[+] 反思完成，记忆已写入（第 {attempt} 条）")
+                st.success(f"✅ 反思完成，记忆已写入（第 {attempt} 条）")
             except Exception as re_err:
                 reflection["root_cause"] = execution_error
                 reflection["fix_strategy"] = "检查语法和数据类型"
                 reflection["avoid"] = "避免假设列名和数据格式"
-                print(f"\n[-] 反思模型调用失败，使用默认记忆：{re_err}")
+                st.error(f"❌ 反思模型调用失败，使用默认记忆：{re_err}")
 
             reflexion_memory.append(reflection)
 
-    # ==========================================
-    # 【新增/优化】：梳理产物 & 熔断机制 (Fail-Fast)
-    # 彻底拦截失败任务，不让后续模型浪费 Token 写无用报告
-    # ==========================================
     data_insights = captured_output.getvalue()
     generated_charts = glob.glob(os.path.join(chart_dir, "chart_*.png"))
 
     if execution_error:
-        print(f"\n[!] 触发熔断机制：代码修复超过 {max_retries} 次依然失败，立即停止后续 Agent 调用以节省 Token。")
-        
-        # 构建一个优雅的降级 HTML 错误报告
-        memory_html = "".join([
-            f"<li style='margin-bottom:8px;'><b>第{m['attempt']}次反思：</b> {m['root_cause']}<br><i style='color:#666;'>对策：{m['fix_strategy']}</i></li>" 
-            for m in reflexion_memory
-        ])
-        
-        error_html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head><meta charset="UTF-8"><title>数据分析中断</title></head>
-<body style="font-family: 'Segoe UI', sans-serif; padding: 20px; background-color: #f4f7f6;">
-    <div style="max-width: 900px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 8px; border-top: 5px solid #e74c3c; box-shadow: 0 4px 15px rgba(0,0,0,0.05);">
-        <h2 style="color: #c0392b; margin-top: 0;">⚠️ 数据分析中断 (熔断保护生效)</h2>
-        <p>AI 程序员经过 <b>{max_retries}</b> 次自我反思与代码重写，仍未能完全解决数据清洗/计算过程中的报错。为节省计算资源 (Token)，已自动停止后续分析报告的生成。</p>
-        
-        <h4 style="color: #2c3e50; border-bottom: 1px solid #eee; padding-bottom: 5px;">最后一次致命报错：</h4>
-        <pre style="background: #fdf2f2; padding: 15px; border-radius: 6px; overflow-x: auto; color: #c0392b; font-size: 14px;">{execution_error}</pre>
-        
-        <h4 style="color: #2c3e50; border-bottom: 1px solid #eee; padding-bottom: 5px; margin-top: 25px;">🧠 AI 努力过的反思记录：</h4>
-        <ul style="background: #f8f9fa; padding: 15px 35px; border-radius: 6px; font-size: 14px; line-height: 1.6;">
-            {memory_html}
-        </ul>
-        
-        <div style="margin-top: 30px; padding: 15px; background: #e8f4f8; border-radius: 6px; color: #2980b9;">
-            <h4 style="margin: 0 0 10px 0;">💡 人工干预建议：</h4>
-            <p style="margin: 0; font-size: 14px;">您的数据中可能存在过于复杂的业务混合格式（如金额列中带有大量文本说明）。建议在左侧“分析需求”框中明确提示 AI，例如：<b>“清洗金额字段时，请用正则表达式强制提取括号前的数字作为浮点数，忽略无法转换的值。”</b></p>
-        </div>
-    </div>
-</body>
-</html>"""
-        
-        # 将错误报告写入文件并直接 return（熔断）
+        st.error(f"🚨 触发熔断机制：代码修复超过 {max_retries} 次依然失败，立即停止后续 Agent 调用以节省 Token。")
+        memory_html = "".join([f"<li style='margin-bottom:8px;'><b>第{m['attempt']}次反思：</b> {m['root_cause']}<br><i style='color:#666;'>对策：{m['fix_strategy']}</i></li>" for m in reflexion_memory])
+        error_html = f"<h2>⚠️ 数据分析中断</h2><pre>{execution_error}</pre><ul>{memory_html}</ul>"
         with open(report_out, "w", encoding="utf-8") as f:
             f.write(error_html)
-        return error_html, report_out
+        return error_html, report_out, {} # 【修改】增加第三个返回值
 
-    # 如果代码执行成功，才记录生成的图表
     chart_status = f"生成的图表文件有：{[os.path.basename(c) for c in generated_charts]}。只能使用对应的占位符！"
 
     # ==========================================
-    # Node 3：🧑‍💼 分析师 Agent — 参考 Planner 计划写报告
+    # Node 3：🧑‍💼 终极分析师 Agent
     # ==========================================
-    print(f"\n===========================================")
-    print("[*] 🧑‍💼 分析师 Agent 正在按计划撰写报告...")
-    print(f"===========================================\n")
+    st.markdown("### 🧑‍💼 分析师 Agent 正在撰写最终洞察报告 (直出模式)...")
 
+    # 【修改】：增加了“部分容错铁律”，不要因为缺图就放弃
     analyst_prompt = ChatPromptTemplate.from_messages([
-        ("system", """你是资深业务分析师。
+        ("system", """你是顶级的商业数据咨询顾问。你的任务是基于运行数据，直接输出一篇排版精美的 Markdown 最终商业洞察报告。
 
-【铁律：禁止数据与图表幻觉】——违反此条视为系统故障
-1. 你只能使用下方【运行数据】中 print() 真实输出的数字。
-2. 绝不能自行编造任何数值。
-3. 【最重要】如果【图表状态】显示没有任何图表生成，或者没有提到某个特定的图表序号，你**绝对禁止**在报告中写出任何类似 [CHART_1]、[CHART_2] 的占位符！千万不要自己预设图表！
+【排版与质检铁律】
+1. 没有任何废话、内心戏，直接输出报告正文。
+2. 必须将整篇报告包裹在 `<FINAL_REPORT>` 和 `</FINAL_REPORT>` 标签之间！
+3. 采用“核心结论 -> 数据证据 -> 商业建议”的逻辑框架。
 
-【分析计划】
-{analysis_plan}
+【部分容错铁律】（重要！）
+如果【运行数据】中包含某些报错信息（如某图表或指标失败），请自动忽略失败的部分，**全力基于成功生成的有效数据**撰写报告。绝不要因为个别数据的缺失而在报告中抱怨或中断生成！
 
-【运行数据】（这是代码实际 print 的内容，是唯一真实数据来源）
-{data_insights}
+【图表与数据反幻觉铁律】
+1. 只使用【运行数据】中的真实数字，严禁编造！
+2. 如果【图表状态】显示有生成的图表（如 chart_1.png），你**必须**在分析逻辑最关键的证据处单独起一行插入 `[CHART_1]`！严禁虚构未生成的图表！
 
-【图表状态】（极其重要：只有这里列出的图表才能使用占位符引用！）
-{chart_status}
-
-处理规则：
-- 若【运行数据】有真实数字：按分析计划解读。
-- 插入图表时，核对【图表状态】。如果状态是"未生成任何图表"，你的报告中禁止出现任何 [CHART_X] 标记。
-- 若【运行数据】为空：直接写"代码未输出任何数据，无法生成报告。"，停止输出"""),
+【输入信息】
+分析计划: {analysis_plan}
+运行数据: {data_insights}
+图表状态: {chart_status}"""),
         ("user", "原需求：{query}")
     ])
 
-    draft_report = ""
+    final_markdown = ""
     try:
+        raw_report = ""
+        report_placeholder = st.empty()
+        count = 0
         for chunk in (analyst_prompt | llm_analyst).stream({
-            "analysis_plan": analysis_plan,
-            "data_insights": data_insights,
-            "chart_status": chart_status,
-            "query": user_query
+            "analysis_plan": analysis_plan, "data_insights": data_insights,
+            "chart_status": chart_status, "query": user_query
         }):
-            draft_report += chunk.content
-            print(chunk.content, end="", flush=True)
-        print("\n\n[+] 草稿撰写完毕！")
+            raw_report += chunk.content
+            count += 1
+            if count % 8 == 0:  # 节流
+                report_placeholder.markdown(raw_report + "▌")
+        report_placeholder.markdown(raw_report)
+            
+        st.success("✅ 最终报告撰写完毕！")
+        match = re.search(r'<FINAL_REPORT>\s*(.*?)\s*</FINAL_REPORT>', raw_report, re.DOTALL)
+        final_markdown = match.group(1).strip() if match else raw_report.strip()
     except Exception as e:
-        draft_report = f"草稿生成失败: {e}"
-
-    # ==========================================
-    # Node 4：⚖️ 检察官 Agent — 格式清洗
-    # ==========================================
-    print(f"\n===========================================")
-    print("[*] ⚖️ 检察官 Agent 正在质检报告...")
-    print(f"===========================================\n")
-
-    judge_prompt = ChatPromptTemplate.from_messages([
-        ("system", """你是冷酷的报告质检总监。
-任务：对草稿进行"脱水"。删掉所有 AI 废话、内心戏和免责声明。保留所有数据、结论和图表占位符。
-【强制要求】必须将最终纯净版 Markdown 报告包裹在 `<FINAL_REPORT>` 和 `</FINAL_REPORT>` 标签之间！"""),
-        ("user", "【草稿】\n{draft}")
-    ])
-
-    final_markdown = draft_report
-    try:
-        raw_judged = ""
-        for chunk in (judge_prompt | llm_judge).stream({"draft": draft_report}):
-            raw_judged += chunk.content
-            print(chunk.content, end="", flush=True)
-
-        print("\n\n[+] 质检完毕，提取精华...")
-        match = re.search(r'<FINAL_REPORT>\s*(.*?)\s*</FINAL_REPORT>', raw_judged, re.DOTALL)
-        final_markdown = match.group(1).strip() if match else raw_judged.strip()
-    except Exception as e:
-        print(f"[-] 检察官调用失败，使用草稿原文：{e}")
+        final_markdown = f"报告生成失败: {e}"
+        st.error(final_markdown)
 
     # ==========================================
     # Node 5：⚙️ 渲染引擎
@@ -414,10 +358,46 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
         dst = os.path.basename(src)
         shutil.copy2(src, dst)
         copied.append(dst)
-    if copied:
-        print(f"[i] 已将图表复制到工作目录: {copied}")
 
-    print("\n[*] ⚙️ 渲染引擎：正在打包 HTML...")
     html_string = generate_html_report(final_markdown, report_out)
 
-    return html_string, report_out
+    # 【修改】：将分析上下文打包返回，留给追问 Agent 使用
+    context_dict = {
+        "plan": analysis_plan,
+        "data": data_insights
+    }
+    return html_string, report_out, context_dict
+
+
+# 【新增】：追问与优化专属 Agent
+def run_followup_chat(user_query: str, chat_history: list, context_data: dict, api_key: str, api_base: str):
+    llm_chat = ChatOpenAI(temperature=0.4, model="deepseek-v3-0324", api_key=api_key, base_url=api_base)
+    
+    system_prompt = """你是一个顶级的数据分析咨询顾问。用户正在就刚刚生成的数据洞察报告向你追问或要求优化。
+    
+    【后台运行真实数据上下文】
+    这是系统刚才跑出来的真实数据统计结果：
+    {data}
+    
+    【回答要求】
+    1. 基于上述真实数据回答用户的追问。如果超出数据范围，请明确告知“当前运行数据中未包含该统计”。
+    2. 如果用户要求优化报告内容，请直接给出优化后的文案。
+    3. 语气保持客观、专业。
+    4. 【重要排版规范】：如果你需要输出表格，请务必使用标准的 Markdown 表格格式！表格前后必须各留一个空行，并且必须包含表头分隔线，例如：
+    
+    | 维度一 | 维度二 |
+    |---|---|
+    | 数据A | 数据B |
+    
+    """
+    
+    messages = [("system", system_prompt.format(data=context_data.get("data", "无数据")))]
+    
+    # 填入历史对话记录
+    for msg in chat_history:
+        messages.append((msg["role"], msg["content"]))
+        
+    messages.append(("user", user_query))
+    prompt = ChatPromptTemplate.from_messages(messages)
+    
+    return (prompt | llm_chat).stream({})
